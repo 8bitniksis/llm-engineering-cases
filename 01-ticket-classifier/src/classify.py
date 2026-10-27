@@ -205,7 +205,7 @@ def print_summary(stats):
     print(f"ушло в failed: {sum(stats['failed'].values())} {dict(stats['failed'])}")
     print(f"fake_llm.calls: {fake_llm.calls}")
     if stats["interrupted"]:
-        print("запуск прерван (Ctrl+C), готовое сохранено")
+        print("запуск прерван (Ctrl+C), готовое сохранено в базе, выгрузка — при перезапуске")
 
 
 def run(input_path, db_path="classify.db", out_dir=None, lock_path="classify.lock", *,
@@ -233,7 +233,10 @@ def run(input_path, db_path="classify.db", out_dir=None, lock_path="classify.loc
                                 pause_cap=pause_cap, window=window, concurrency=concurrency))
         except KeyboardInterrupt:
             stats["interrupted"] = True
-        export(conn, input_path.stem, out_dir)
+        # п. 9: неполный пакет не выгружаем — его могут забрать и разослать до перезапуска;
+        # готовое лежит в базе и уйдёт в выгрузку перезапуска или следующего пакета
+        if not stats["interrupted"]:
+            export(conn, input_path.stem, out_dir)
     finally:
         conn.close()
         lock.release()
