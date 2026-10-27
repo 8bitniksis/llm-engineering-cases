@@ -68,13 +68,22 @@ class Base(unittest.TestCase):
         self.out = out.getvalue()
         return code
 
+    def out_path(self, name, kind):
+        """Файл выгрузки пакета: имя — <вход>-<хэш содержимого>.<kind>.jsonl; None, если нет."""
+        found = list(self.dir.glob(f"{name}-*.{kind}.jsonl"))
+        self.assertLessEqual(len(found), 1, found)
+        return found[0] if found else None
+
     def rows(self, name, kind):
-        p = self.dir / f"{name}.{kind}.jsonl"
-        return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines()]
+        return [json.loads(l) for l in self.out_path(name, kind).read_text(encoding="utf-8").splitlines()]
 
     def row(self, tid):
         with contextlib.closing(sqlite3.connect(self.db)) as c:
             return c.execute("SELECT status, category, reason, runs, attempts FROM results WHERE id=?", (tid,)).fetchone()
+
+    def text(self, tid):
+        with contextlib.closing(sqlite3.connect(self.db)) as c:
+            return c.execute("SELECT text FROM results WHERE id=?", (tid,)).fetchone()[0]
 
 
 class ParseTest(unittest.TestCase):
@@ -132,20 +141,20 @@ class RunTest(Base):
         f = Fake({"bad": ["не знаю"]})
         inp = self.make_input("b1", [("1", "good"), ("2", "bad")])
         self.run_cls(inp, f)
-        out1 = (self.dir / "b1.out.jsonl").read_bytes()
-        failed1 = (self.dir / "b1.failed.jsonl").read_bytes()
+        out1 = self.out_path("b1", "out").read_bytes()
+        failed1 = self.out_path("b1", "failed").read_bytes()
         calls = f.calls
         self.run_cls(inp, f)
         self.assertEqual(f.calls, calls)  # и ни одного нового вызова
-        self.assertEqual((self.dir / "b1.out.jsonl").read_bytes(), out1)
-        self.assertEqual((self.dir / "b1.failed.jsonl").read_bytes(), failed1)
+        self.assertEqual(self.out_path("b1", "out").read_bytes(), out1)
+        self.assertEqual(self.out_path("b1", "failed").read_bytes(), failed1)
 
     def test_rerun_after_crash_between_mark_and_write(self):
         # п. 9: пометили пакет, файлы не записали; перезапуск пишет те же файлы
         f = Fake()
         inp = self.make_input("b1", [("1", "a")])
         self.run_cls(inp, f)
-        (self.dir / "b1.out.jsonl").unlink()
+        self.out_path("b1", "out").unlink()
         self.run_cls(inp, f)
         self.assertEqual(self.rows("b1", "out"), [{"id": "1", "category": "карты"}])
 
@@ -193,18 +202,54 @@ class RunTest(Base):
 
         inp = self.make_input("b1", [(str(i), f"t{i}") for i in range(200)])
         self.assertEqual(self.run_cls(inp, interrupting, timeout=5), 130)
-        self.assertFalse((self.dir / "b1.out.jsonl").exists())
+        self.assertIsNone(self.out_path("b1", "out"))
         calls1 = f.calls
         self.assertEqual(self.run_cls(inp, f, timeout=5), 0)
         self.assertEqual(sorted(r["id"] for r in self.rows("b1", "out")), sorted(str(i) for i in range(200)))
         self.assertLess(f.calls - calls1, 200)  # готовое из первого запуска не оплачено повторно
 
-    def test_lock_busy_exits_zero_without_calls(self):
+    def test_unexpected_error_is_temporary(self):
+        # неизвестная ошибка API не роняет пакет: обращение в retry, остальные обработаны
+        f = Fake({"bad": [ConnectionResetError("reset")]})
+        with self.assertLogs("classify", "ERROR"):
+            self.run_cls(self.make_input("b1", [("1", "bad"), ("2", "good")]), f)
+        self.assertEqual(self.row("1")[:3], ("retry", None, "unexpected: ConnectionResetError"))
+        self.assertEqual(self.row("2")[:2], ("ok", "карты"))
+
+    def test_text_kept_only_for_retry(self):
+        f = Fake({"bad": [fake_llm.ServerError("x")]})
+        self.run_cls(self.make_input("b1", [("1", "good"), ("2", "bad")]), f)
+        self.assertIsNone(self.text("1"))
+        self.assertEqual(self.text("2"), "bad")
+        f.script = {}
+        self.run_cls(self.make_input("b2", []), f)
+        self.assertIsNone(self.text("2"))  # стал ok — текст затёрт
+
+    def test_same_file_name_new_content_is_new_batch(self):
+        # tickets.jsonl каждые 15 минут: файл с тем же именем, другое содержимое — отдельный пакет
+        f = Fake()
+        self.run_cls(self.make_input("tickets", [("1", "a")]), f)
+        first = self.out_path("tickets", "out").name
+        (self.dir / first).rename(self.dir / "taken.jsonl")  # система рассылки забрала файл
+        self.run_cls(self.make_input("tickets", [("2", "b")]), f)
+        self.assertEqual(self.rows("tickets", "out"), [{"id": "2", "category": "карты"}])
+        self.assertNotEqual(self.out_path("tickets", "out").name, first)
+
+    def test_deadline_stops_without_export(self):
+        f = Fake(delay=0.05)
+        inp = self.make_input("b1", [(str(i), f"t{i}") for i in range(100)])
+        self.assertEqual(self.run_cls(inp, f, timeout=5, deadline=0.1), 4)
+        self.assertIsNone(self.out_path("b1", "out"))
+        self.assertIn("дедлайн", self.out)
+        self.assertEqual(self.run_cls(inp, f, timeout=5), 0)  # перезапуск на том же файле доделывает
+        self.assertEqual(len(self.rows("b1", "out")), 100)
+
+    def test_lock_busy_exits_nonzero_without_calls(self):
         held = classify.Lock(self.dir / "c.lock")
         self.assertTrue(held.acquire())
         try:
             f = Fake()
-            self.assertEqual(self.run_cls(self.make_input("b1", [("1", "a")]), f), 0)
+            self.assertEqual(self.run_cls(self.make_input("b1", [("1", "a")]), f), 3)
             self.assertEqual(f.calls, 0)
         finally:
             held.release()

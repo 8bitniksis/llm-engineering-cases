@@ -1,6 +1,7 @@
 """Пакетная классификация обращений через LLM API. Решения — в PROMPT.md (номера пунктов в комментариях)."""
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -90,16 +91,20 @@ def tickets_to_process(conn, input_path, seen, stats):
 
 
 def save(conn, tid, text, status, category, reason, runs, attempts):
+    if status != "retry":
+        text = None  # текст обращения — персональные данные; хранится, только пока нужен для retry
     conn.execute(
         """INSERT INTO results(id, text, status, category, reason, runs, attempts, batch)
            VALUES(?,?,?,?,?,?,?,NULL)
-           ON CONFLICT(id) DO UPDATE SET status=excluded.status, category=excluded.category,
-               reason=excluded.reason, runs=excluded.runs, attempts=excluded.attempts""",
+           ON CONFLICT(id) DO UPDATE SET text=excluded.text, status=excluded.status,
+               category=excluded.category, reason=excluded.reason, runs=excluded.runs,
+               attempts=excluded.attempts""",
         (tid, text, status, category, reason, runs, attempts))
     conn.commit()  # п. 2: коммит на каждую запись
 
 
-async def process(conn, tickets, stats, *, timeout, attempts, pause_base, pause_cap, window, concurrency):
+async def process(conn, tickets, stats, *, timeout, attempts, pause_base, pause_cap, window, concurrency,
+                  deadline):
     sem = asyncio.Semaphore(concurrency)  # п. 3
 
     async def handle(tid, text, runs, prev_attempts):
@@ -119,6 +124,11 @@ async def process(conn, tickets, stats, *, timeout, attempts, pause_base, pause_
                     err = "server_error"
                 except asyncio.TimeoutError:
                     err = "timeout"
+                except Exception as e:
+                    # неизвестная ошибка API (ConnectionResetError и т. п.) не роняет пакет:
+                    # считаем временной, предел MAX_RUNS не даёт одному обращению валить каждый запуск
+                    err = f"unexpected: {type(e).__name__}"
+                    log.exception("обращение %s: неизвестная ошибка API", tid)
             if err is None:
                 cat, how = parse_answer(raw)
                 if cat is not None:
@@ -154,13 +164,17 @@ async def process(conn, tickets, stats, *, timeout, attempts, pause_base, pause_
 
     pending = set()
     try:
-        for t in tickets:
-            while len(pending) >= window:  # п. 4
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for d in done:
-                    d.result()
-            pending.add(asyncio.create_task(handle(*t)))
-        await asyncio.gather(*pending)
+        # дедлайн запуска: зависший запуск не держит блокировку вечно и не глушит следующие
+        async with asyncio.timeout(deadline):
+            for t in tickets:
+                while len(pending) >= window:  # п. 4
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for d in done:
+                        d.result()
+                pending.add(asyncio.create_task(handle(*t)))
+            await asyncio.gather(*pending)
+    except TimeoutError:
+        stats["deadline"] = True
     except asyncio.CancelledError:
         stats["interrupted"] = True
     finally:
@@ -206,37 +220,54 @@ def print_summary(stats):
     print(f"fake_llm.calls: {fake_llm.calls}")
     if stats["interrupted"]:
         print("запуск прерван (Ctrl+C), готовое сохранено в базе, выгрузка — при перезапуске")
+    if stats["deadline"]:
+        print("ERROR: дедлайн запуска истёк, пакет не доделан — перезапустить на том же файле")
+
+
+def batch_name(path):
+    """Имя файла + хэш содержимого: тот же файл после сбоя даёт то же имя (выгрузка идемпотентна),
+    другой файл с тем же именем — другое (иначе tickets.jsonl каждые 15 минут копил бы один пакет)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return f"{path.stem}-{h.hexdigest()[:8]}"
 
 
 def run(input_path, db_path="classify.db", out_dir=None, lock_path="classify.lock", *,
-        timeout=10.0, attempts=4, pause_base=0.5, pause_cap=8.0, window=100, concurrency=20):
-    """Возвращает код выхода: 0 — ок, 2 — системные технические отказы, 130 — прервано."""
+        timeout=10.0, attempts=4, pause_base=0.5, pause_cap=8.0, window=100, concurrency=20,
+        deadline=720.0):
+    """Код выхода: 0 — ок, 2 — системные технические отказы, 3 — блокировка занята,
+    4 — истёк дедлайн, 130 — прервано."""
     input_path = Path(input_path)
     out_dir = Path(out_dir) if out_dir else input_path.parent
     lock = Lock(lock_path)
     if not lock.acquire():
-        log.warning("предыдущий запуск ещё работает")
-        return 0
+        # дедлайн (12 мин) меньше интервала (15 мин), так что занятая блокировка — аномалия:
+        # ненулевой код, чтобы планировщик это показал, а не молчал сутки
+        log.error("предыдущий запуск ещё работает")
+        return 3
     stats = Counter()
     stats["failed"] = Counter()
     stats["unfixed_raw"] = Counter()
     conn = sqlite3.connect(db_path)
     try:
-        # WAL + NORMAL: коммит переживает падение процесса и Ctrl+C без fsync на каждую запись
-        # (ponytail: при потере питания хвост WAL может пропасть; для этого synchronous=FULL)
+        # WAL + NORMAL: коммит переживает падение процесса и Ctrl+C без fsync на каждую запись.
+        # При потере питания хвост WAL может пропасть; если это важно — synchronous=FULL (~0,1 с на коммит)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(SCHEMA)
         try:
             asyncio.run(process(conn, tickets_to_process(conn, input_path, set(), stats), stats,
                                 timeout=timeout, attempts=attempts, pause_base=pause_base,
-                                pause_cap=pause_cap, window=window, concurrency=concurrency))
+                                pause_cap=pause_cap, window=window, concurrency=concurrency,
+                                deadline=deadline))
         except KeyboardInterrupt:
             stats["interrupted"] = True
         # п. 9: неполный пакет не выгружаем — его могут забрать и разослать до перезапуска;
         # готовое лежит в базе и уйдёт в выгрузку перезапуска или следующего пакета
-        if not stats["interrupted"]:
-            export(conn, input_path.stem, out_dir)
+        if not stats["interrupted"] and not stats["deadline"]:
+            export(conn, batch_name(input_path), out_dir)
     finally:
         conn.close()
         lock.release()
@@ -245,6 +276,8 @@ def run(input_path, db_path="classify.db", out_dir=None, lock_path="classify.loc
     if stats["processed"] and tech / stats["processed"] > TECH_ALERT:
         print(f"WARNING: технических отказов {tech} из {stats['processed']} (> {TECH_ALERT:.0%})")
         return 2
+    if stats["deadline"]:
+        return 4
     return 130 if stats["interrupted"] else 0
 
 
@@ -258,10 +291,11 @@ def main():
     ap.add_argument("--attempts", type=int, default=4)
     ap.add_argument("--pause-base", type=float, default=0.5)
     ap.add_argument("--pause-cap", type=float, default=8.0)
+    ap.add_argument("--deadline", type=float, default=720.0, help="секунд на запуск, меньше интервала планировщика")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     sys.exit(run(a.input, a.db, a.out_dir, a.lock, timeout=a.timeout, attempts=a.attempts,
-                 pause_base=a.pause_base, pause_cap=a.pause_cap))
+                 pause_base=a.pause_base, pause_cap=a.pause_cap, deadline=a.deadline))
 
 
 if __name__ == "__main__":
