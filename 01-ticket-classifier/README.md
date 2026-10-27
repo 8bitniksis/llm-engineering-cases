@@ -196,7 +196,7 @@ with open("tickets.jsonl", "w", encoding="utf-8") as f:
 ```
 python scripts/make_sample.py              # data/sample.jsonl, 2000 обращений
 python src/classify.py data/sample.jsonl   # --help — таймаут, попытки, пути
-python -m unittest discover -s tests       # 12 тестов, ~5 с
+python -m unittest discover -s tests       # 13 тестов, ~5 с
 ```
 
 Код выхода: 0 — ок или уже работает другой запуск, 2 — технических отказов больше 5 %

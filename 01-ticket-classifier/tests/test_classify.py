@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import json
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -180,6 +181,23 @@ class RunTest(Base):
         code = self.run_cls(self.make_input("b1", [("1", "bad"), ("2", "ok")]), f)
         self.assertEqual(code, 2)
         self.assertIn("WARNING", self.out)
+
+    def test_ctrl_c_no_export_then_rerun_completes(self):
+        # п. 10: прерванный запуск не выгружает неполный пакет, перезапуск доделывает
+        f = Fake(delay=0.01)
+
+        async def interrupting(text):
+            if f.calls == 50:
+                signal.raise_signal(signal.SIGINT)
+            return await f(text)
+
+        inp = self.make_input("b1", [(str(i), f"t{i}") for i in range(200)])
+        self.assertEqual(self.run_cls(inp, interrupting, timeout=5), 130)
+        self.assertFalse((self.dir / "b1.out.jsonl").exists())
+        calls1 = f.calls
+        self.assertEqual(self.run_cls(inp, f, timeout=5), 0)
+        self.assertEqual(sorted(r["id"] for r in self.rows("b1", "out")), sorted(str(i) for i in range(200)))
+        self.assertLess(f.calls - calls1, 200)  # готовое из первого запуска не оплачено повторно
 
     def test_lock_busy_exits_zero_without_calls(self):
         held = classify.Lock(self.dir / "c.lock")
